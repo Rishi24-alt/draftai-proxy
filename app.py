@@ -1,16 +1,35 @@
 import os
 import json
 import urllib.request
-import urllib.parse
-from flask import Flask, request, Response
+from flask import Flask, request, Response, jsonify
 
-app  = Flask(__name__)
-KEY  = os.environ.get("OPENAI_API_KEY", "")
-BASE = "https://api.openai.com"
+app   = Flask(__name__)
+KEY   = os.environ.get("OPENAI_API_KEY", "")
+BASE  = "https://api.openai.com"
+
+# In-memory store for add-in results
+# In production use Redis or a database
+results_store = {}
 
 @app.route("/ping", methods=["GET"])
 def ping():
     return {"status": "ok"}
+
+@app.route("/addin/push", methods=["POST"])
+def addin_push():
+    """Add-in POSTs its result here"""
+    data = request.get_json()
+    session_id = data.get("session_id", "default")
+    results_store[session_id] = data
+    return {"status": "received"}
+
+@app.route("/addin/poll/<session_id>", methods=["GET"])
+def addin_poll(session_id):
+    """Streamlit polls this to get add-in result"""
+    result = results_store.pop(session_id, None)
+    if result:
+        return jsonify(result)
+    return jsonify({"status": "waiting"})
 
 @app.route("/<path:path>", methods=["GET","POST","DELETE","PUT"])
 def proxy(path):

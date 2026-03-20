@@ -4,7 +4,7 @@ import time
 import urllib.request
 from flask import Flask, request, Response, jsonify
 
-app  = Flask(_name_)
+app = Flask(_name_)
 KEY  = os.environ.get("OPENAI_API_KEY", "")
 BASE = "https://api.openai.com"
 

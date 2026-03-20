@@ -1,53 +1,134 @@
 import os
 import json
+import time
 import urllib.request
 from flask import Flask, request, Response, jsonify
 
-app   = Flask(__name__)
-KEY   = os.environ.get("OPENAI_API_KEY", "")
-BASE  = "https://api.openai.com"
+app  = Flask(__name__)
+KEY  = os.environ.get("OPENAI_API_KEY", "")
+BASE = "https://api.openai.com"
 
-# In-memory store for add-in results
-# In production use Redis or a database
-results_store = {}
+# ─────────────────────────────────────────────────────────────
+# In-memory store for add-in relay
+# Stores: pending jobs and results
+# ─────────────────────────────────────────────────────────────
+pending_jobs = {}   # session_id -> job dict
+results      = {}   # session_id -> result dict
+addin_status = {"online": False, "last_seen": 0}
+
+
+# ─────────────────────────────────────────────────────────────
+# Basic routes
+# ─────────────────────────────────────────────────────────────
 
 @app.route("/ping", methods=["GET"])
 def ping():
-    return {"status": "ok"}
+    return jsonify({"status": "ok"})
 
-@app.route("/addin/push", methods=["POST"])
-def addin_push():
-    """Add-in POSTs its result here"""
-    data = request.get_json()
-    session_id = data.get("session_id", "default")
-    results_store[session_id] = data
-    return {"status": "received"}
+
+# ─────────────────────────────────────────────────────────────
+# Add-in relay endpoints — called by DraftAIAddin.cs
+# ─────────────────────────────────────────────────────────────
+
+@app.route("/addin/register", methods=["POST"])
+def addin_register():
+    """Add-in calls this on startup to mark itself online."""
+    addin_status["online"]    = True
+    addin_status["last_seen"] = time.time()
+    return jsonify({"status": "registered"})
+
+
+@app.route("/addin/status", methods=["GET"])
+def addin_status_check():
+    """Website checks if any add-in is currently online."""
+    # Consider offline if no heartbeat in last 30 seconds
+    online = addin_status["online"] and (time.time() - addin_status["last_seen"]) < 30
+    return jsonify({"online": online})
+
+
+@app.route("/addin/job", methods=["GET"])
+def addin_get_job():
+    """Add-in polls this to pick up jobs from website users."""
+    addin_status["online"]    = True
+    addin_status["last_seen"] = time.time()
+
+    # Return oldest pending job if any
+    if pending_jobs:
+        session_id = next(iter(pending_jobs))
+        job = pending_jobs.pop(session_id)
+        return jsonify(job)
+
+    return jsonify({"job": None, "session_id": None})
+
+
+@app.route("/addin/job", methods=["POST"])
+def addin_push_job():
+    """Website pushes a job here for the add-in to pick up."""
+    data       = request.get_json()
+    session_id = data.get("session_id")
+    if not session_id:
+        return jsonify({"error": "No session_id"}), 400
+    pending_jobs[session_id] = data
+    return jsonify({"status": "queued", "session_id": session_id})
+
+
+@app.route("/addin/result", methods=["POST"])
+def addin_push_result():
+    """Add-in pushes its result here after processing a job."""
+    data       = request.get_json()
+    session_id = data.get("session_id")
+    if not session_id:
+        return jsonify({"error": "No session_id"}), 400
+    results[session_id] = data
+    return jsonify({"status": "stored"})
+
 
 @app.route("/addin/poll/<session_id>", methods=["GET"])
-def addin_poll(session_id):
-    """Streamlit polls this to get add-in result"""
-    result = results_store.pop(session_id, None)
-    if result:
+def addin_poll_result(session_id):
+    """Website polls this to get the result for a session."""
+    if session_id in results:
+        result = results.pop(session_id)
         return jsonify(result)
     return jsonify({"status": "waiting"})
 
-@app.route("/<path:path>", methods=["GET","POST","DELETE","PUT"])
+
+# ─────────────────────────────────────────────────────────────
+# OpenAI proxy — forward all other requests to OpenAI
+# ─────────────────────────────────────────────────────────────
+
+@app.route("/analyze", methods=["POST"])
+def analyze():
+    """Legacy endpoint for the SolidWorks add-in direct calls."""
+    return _proxy_to_openai("v1/chat/completions")
+
+
+@app.route("/<path:path>", methods=["GET", "POST", "DELETE", "PUT"])
 def proxy(path):
+    return _proxy_to_openai(path)
+
+
+def _proxy_to_openai(path):
     url  = f"{BASE}/{path}"
     body = request.get_data()
-    req  = urllib.request.Request(
-        url,
-        data=body if body else None,
-        headers={
-            "Content-Type":    request.content_type or "application/json",
-            "Authorization":   f"Bearer {KEY}",
-        },
-        method=request.method,
-    )
-    with urllib.request.urlopen(req, timeout=60) as r:
-        result = r.read()
-        content_type = r.headers.get("Content-Type", "application/json")
-    return Response(result, content_type=content_type)
+    try:
+        req = urllib.request.Request(
+            url,
+            data=body if body else None,
+            headers={
+                "Content-Type":  request.content_type or "application/json",
+                "Authorization": f"Bearer {KEY}",
+            },
+            method=request.method,
+        )
+        with urllib.request.urlopen(req, timeout=60) as r:
+            result       = r.read()
+            content_type = r.headers.get("Content-Type", "application/json")
+        return Response(result, content_type=content_type)
+    except urllib.error.HTTPError as e:
+        return Response(e.read(), status=e.code, content_type="application/json")
+    except Exception as ex:
+        return jsonify({"error": str(ex)}), 500
+
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))

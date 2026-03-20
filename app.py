@@ -4,7 +4,7 @@ import time
 import urllib.request
 from flask import Flask, request, Response, jsonify
 
-app  = Flask(__name__)
+app  = Flask(_name_)
 KEY  = os.environ.get("OPENAI_API_KEY", "")
 BASE = "https://api.openai.com"
 
@@ -96,14 +96,28 @@ def addin_poll_result(session_id):
 # OpenAI proxy — forward all other requests to OpenAI
 # ─────────────────────────────────────────────────────────────
 
+# ─────────────────────────────────────────────────────────────
+# OpenAI proxy — forward all other requests to OpenAI
+# ─────────────────────────────────────────────────────────────
+
 @app.route("/analyze", methods=["POST"])
 def analyze():
     """Legacy endpoint for the SolidWorks add-in direct calls."""
     return _proxy_to_openai("v1/chat/completions")
 
 
+@app.route("/v1/<path:path>", methods=["GET", "POST", "DELETE", "PUT"])
+def proxy_v1(path):
+    """Handle all OpenAI v1 API calls."""
+    return _proxy_to_openai(f"v1/{path}")
+
+
 @app.route("/<path:path>", methods=["GET", "POST", "DELETE", "PUT"])
 def proxy(path):
+    """Catch-all for any other paths."""
+    # Don't proxy addin routes
+    if path.startswith("addin/"):
+        return jsonify({"error": "Not found"}), 404
     return _proxy_to_openai(path)
 
 
@@ -130,6 +144,6 @@ def _proxy_to_openai(path):
         return jsonify({"error": str(ex)}), 500
 
 
-if __name__ == "__main__":
+if _name_ == "_main_":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)

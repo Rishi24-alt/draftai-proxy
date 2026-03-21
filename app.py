@@ -108,20 +108,30 @@ def addin_push_result():
 @app.route("/addin/connect", methods=["POST"])
 def user_connect():
     """
-    User's browser requests a dedicated add-in connection.
-    Returns the addin_id assigned to this user session.
+    User requests a dedicated add-in.
+    If user_token provided, only connects to add-in registered with that token.
     """
-    data           = request.get_json() or {}
-    user_session   = data.get("user_session")
+    data         = request.get_json() or {}
+    user_session = data.get("user_session")
+    user_token   = data.get("user_token")  # optional — ties user to their own add-in
+
     if not user_session:
         return jsonify({"error": "No user_session"}), 400
 
-    # If user already has an add-in assigned and it's still online, reuse it
+    # If user already has an assigned add-in that's still online, reuse it
     existing = user_addin_map.get(user_session)
     if existing and _addin_online(existing):
         return jsonify({"addin_id": existing, "status": "reused"})
 
-    # Assign a free add-in
+    # If user_token provided, find the matching add-in
+    if user_token:
+        for aid in addin_instances:
+            if aid.startswith(user_token) and _addin_online(aid) and not addin_instances[aid].get("busy"):
+                user_addin_map[user_session] = aid
+                return jsonify({"addin_id": aid, "status": "assigned"})
+        return jsonify({"addin_id": None, "status": "no_addin_available"})
+
+    # No token — assign any available add-in
     addin_id = _available_addin()
     if not addin_id:
         return jsonify({"addin_id": None, "status": "no_addin_available"})
@@ -149,6 +159,13 @@ def addin_poll_result(session_id):
         result = results.pop(session_id)
         return jsonify(result)
     return jsonify({"status": "waiting"})
+
+
+@app.route("/addin/alive/<addin_id>", methods=["GET"])
+def addin_alive(addin_id):
+    """Check if a specific add-in instance is still online."""
+    online = addin_id in addin_instances and _addin_online(addin_id)
+    return jsonify({"online": online})
 
 
 # ─────────────────────────────────────────────────────────────

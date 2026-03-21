@@ -160,6 +160,12 @@ def analyze():
     return _proxy_to_openai("v1/chat/completions")
 
 
+@app.route("/chat/completions", methods=["POST"])
+def chat_completions_no_v1():
+    """Handle requests missing the /v1 prefix."""
+    return _proxy_to_openai("v1/chat/completions")
+
+
 @app.route("/v1/chat/completions", methods=["POST"])
 def chat_completions():
     return _proxy_to_openai("v1/chat/completions")

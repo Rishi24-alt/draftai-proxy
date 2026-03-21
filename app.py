@@ -1,5 +1,4 @@
 import os
-import json
 import time
 import urllib.request
 from flask import Flask, request, Response, jsonify
@@ -9,16 +8,40 @@ KEY  = os.environ.get("OPENAI_API_KEY", "")
 BASE = "https://api.openai.com"
 
 # ─────────────────────────────────────────────────────────────
-# In-memory store for add-in relay
-# Stores: pending jobs and results
+# Session-based routing stores
+#
+# addin_instances  : addin_id -> { last_seen, busy }
+# user_addin_map   : user_session_id -> addin_id
+# pending_jobs     : addin_id -> job dict  (one job per add-in)
+# results          : user_session_id -> result dict
 # ─────────────────────────────────────────────────────────────
-pending_jobs = {}   # session_id -> job dict
-results      = {}   # session_id -> result dict
-addin_status = {"online": False, "last_seen": 0}
+addin_instances = {}   # addin_id -> {last_seen, busy}
+user_addin_map  = {}   # user_session_id -> addin_id
+pending_jobs    = {}   # addin_id -> job
+results         = {}   # user_session_id -> result
+
+
+def _addin_online(addin_id):
+    """Check if a specific add-in is still alive (heartbeat < 15s)."""
+    a = addin_instances.get(addin_id)
+    return a is not None and (time.time() - a["last_seen"]) < 15
+
+
+def _any_addin_online():
+    """Check if at least one add-in is online."""
+    return any(_addin_online(aid) for aid in addin_instances)
+
+
+def _available_addin():
+    """Return first non-busy online add-in ID, or None."""
+    for aid, info in addin_instances.items():
+        if _addin_online(aid) and not info.get("busy"):
+            return aid
+    return None
 
 
 # ─────────────────────────────────────────────────────────────
-# Basic routes
+# Basic
 # ─────────────────────────────────────────────────────────────
 
 @app.route("/ping", methods=["GET"])
@@ -27,65 +50,101 @@ def ping():
 
 
 # ─────────────────────────────────────────────────────────────
-# Add-in relay endpoints — called by DraftAIAddin.cs
+# Add-in endpoints (called by DraftAIAddin.cs)
 # ─────────────────────────────────────────────────────────────
 
 @app.route("/addin/register", methods=["POST"])
 def addin_register():
-    """Add-in calls this on startup to mark itself online."""
-    addin_status["online"]    = True
-    addin_status["last_seen"] = time.time()
-    return jsonify({"status": "registered"})
+    """Add-in registers on startup with its unique ID."""
+    data     = request.get_json() or {}
+    addin_id = data.get("addin_id")
+    if not addin_id:
+        return jsonify({"error": "No addin_id"}), 400
+    addin_instances[addin_id] = {"last_seen": time.time(), "busy": False}
+    return jsonify({"status": "registered", "addin_id": addin_id})
 
 
 @app.route("/addin/status", methods=["GET"])
 def addin_status_check():
-    """Website checks if any add-in is currently online."""
-    # Consider offline if no heartbeat in last 30 seconds
-    online = addin_status["online"] and (time.time() - addin_status["last_seen"]) < 30
-    return jsonify({"online": online})
+    """Website checks if any add-in is online."""
+    return jsonify({"online": _any_addin_online()})
 
 
-@app.route("/addin/job", methods=["GET"])
-def addin_get_job():
-    """Add-in polls this to pick up jobs from website users."""
-    addin_status["online"]    = True
-    addin_status["last_seen"] = time.time()
+@app.route("/addin/job/<addin_id>", methods=["GET"])
+def addin_get_job(addin_id):
+    """Add-in polls for ITS OWN jobs only."""
+    # Update heartbeat
+    if addin_id in addin_instances:
+        addin_instances[addin_id]["last_seen"] = time.time()
+    else:
+        addin_instances[addin_id] = {"last_seen": time.time(), "busy": False}
 
-    # Return oldest pending job if any
-    if pending_jobs:
-        session_id = next(iter(pending_jobs))
-        job = pending_jobs.pop(session_id)
+    job = pending_jobs.pop(addin_id, None)
+    if job:
+        addin_instances[addin_id]["busy"] = True
         return jsonify(job)
-
     return jsonify({"job": None, "session_id": None})
-
-
-@app.route("/addin/job", methods=["POST"])
-def addin_push_job():
-    """Website pushes a job here for the add-in to pick up."""
-    data       = request.get_json()
-    session_id = data.get("session_id")
-    if not session_id:
-        return jsonify({"error": "No session_id"}), 400
-    pending_jobs[session_id] = data
-    return jsonify({"status": "queued", "session_id": session_id})
 
 
 @app.route("/addin/result", methods=["POST"])
 def addin_push_result():
-    """Add-in pushes its result here after processing a job."""
-    data       = request.get_json()
-    session_id = data.get("session_id")
+    """Add-in pushes result back — marks itself as free."""
+    data          = request.get_json() or {}
+    session_id    = data.get("session_id")
+    addin_id      = data.get("addin_id")
     if not session_id:
         return jsonify({"error": "No session_id"}), 400
     results[session_id] = data
+    # Free up the add-in
+    if addin_id and addin_id in addin_instances:
+        addin_instances[addin_id]["busy"] = False
     return jsonify({"status": "stored"})
+
+
+# ─────────────────────────────────────────────────────────────
+# Website endpoints (called by cad_converter.py)
+# ─────────────────────────────────────────────────────────────
+
+@app.route("/addin/connect", methods=["POST"])
+def user_connect():
+    """
+    User's browser requests a dedicated add-in connection.
+    Returns the addin_id assigned to this user session.
+    """
+    data           = request.get_json() or {}
+    user_session   = data.get("user_session")
+    if not user_session:
+        return jsonify({"error": "No user_session"}), 400
+
+    # If user already has an add-in assigned and it's still online, reuse it
+    existing = user_addin_map.get(user_session)
+    if existing and _addin_online(existing):
+        return jsonify({"addin_id": existing, "status": "reused"})
+
+    # Assign a free add-in
+    addin_id = _available_addin()
+    if not addin_id:
+        return jsonify({"addin_id": None, "status": "no_addin_available"})
+
+    user_addin_map[user_session] = addin_id
+    return jsonify({"addin_id": addin_id, "status": "assigned"})
+
+
+@app.route("/addin/job", methods=["POST"])
+def addin_push_job():
+    """Website pushes a job to a SPECIFIC add-in instance."""
+    data       = request.get_json() or {}
+    session_id = data.get("session_id")
+    addin_id   = data.get("addin_id")
+    if not session_id or not addin_id:
+        return jsonify({"error": "Need session_id and addin_id"}), 400
+    pending_jobs[addin_id] = data
+    return jsonify({"status": "queued"})
 
 
 @app.route("/addin/poll/<session_id>", methods=["GET"])
 def addin_poll_result(session_id):
-    """Website polls this to get the result for a session."""
+    """Website polls for its job result."""
     if session_id in results:
         result = results.pop(session_id)
         return jsonify(result)
@@ -93,29 +152,26 @@ def addin_poll_result(session_id):
 
 
 # ─────────────────────────────────────────────────────────────
-# OpenAI proxy — forward all other requests to OpenAI
-# ─────────────────────────────────────────────────────────────
-
-# ─────────────────────────────────────────────────────────────
-# OpenAI proxy — forward all other requests to OpenAI
+# OpenAI proxy
 # ─────────────────────────────────────────────────────────────
 
 @app.route("/analyze", methods=["POST"])
 def analyze():
-    """Legacy endpoint for the SolidWorks add-in direct calls."""
+    return _proxy_to_openai("v1/chat/completions")
+
+
+@app.route("/v1/chat/completions", methods=["POST"])
+def chat_completions():
     return _proxy_to_openai("v1/chat/completions")
 
 
 @app.route("/v1/<path:path>", methods=["GET", "POST", "DELETE", "PUT"])
 def proxy_v1(path):
-    """Handle all OpenAI v1 API calls."""
     return _proxy_to_openai(f"v1/{path}")
 
 
 @app.route("/<path:path>", methods=["GET", "POST", "DELETE", "PUT"])
 def proxy(path):
-    """Catch-all for any other paths."""
-    # Don't proxy addin routes
     if path.startswith("addin/"):
         return jsonify({"error": "Not found"}), 404
     return _proxy_to_openai(path)
